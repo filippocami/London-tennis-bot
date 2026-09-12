@@ -1,0 +1,44 @@
+name: Court watcher
+
+on:
+  schedule:
+    # GitHub cron is UTC and does NOT follow British Summer Time.
+    # These are 07:10 and 18:10 London during BST (Mar-Oct).
+    # In winter they become 06:10 and 17:10 - bump both hours by 1 if you care.
+    - cron: "10 6 * * *"
+    - cron: "10 17 * * *"
+  workflow_dispatch:        # lets you run it by hand from the Actions tab
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install httpx playwright
+          playwright install --with-deps chromium
+
+      - name: Check courts
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          CHAT_ID: ${{ secrets.CHAT_ID }}
+        run: python courts.py
+
+      # Only useful when something breaks - lets you read the rendered page
+      # text from the Actions run instead of guessing.
+      - name: Upload debug output
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-pages
+          path: debug/
+          if-no-files-found: ignore
