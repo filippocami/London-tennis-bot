@@ -2,8 +2,8 @@
 """
 Royal Parks court watcher -> Telegram.
 
-Checks tennis and padel availability at The Courts in Hyde Park and
-The Regent's Park (Royal Parks / OpenPlay "Flow" booking system).
+Tennis and padel availability at The Courts in Hyde Park and The Regent's Park
+(Royal Parks / OpenPlay "Flow" booking system).
 
     python courts.py            # check and send to Telegram
     python courts.py --dry-run  # print, send nothing
@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import html
 import os
 import re
 import sys
@@ -34,20 +35,20 @@ LOCATIONS = {
 
 ACTIVITIES = ["tennis", "padel"]
 
+ACTIVITY_LABELS = {"tennis": "TENNIS", "padel": "PADEL"}
+
 BASE_URL = (
     "https://sportsandleisureroyalparks.bookings.flow.onl"
     "/location/{location}/{activity}/{date}/by-time"
 )
 
-# Courts open 7 days ahead, released daily at 07:00. Looking further is wasted
-# effort: those pages either show nothing or show slots you can't book yet.
+# Courts open 7 days ahead, released daily at 07:00. Don't raise this.
 MAX_DAYS_AHEAD = 7
 
 # Mon=0 ... Sun=6. {5, 6} = weekends only. Use set(range(7)) for every day.
 WANTED_WEEKDAYS = {5, 6}
 
-# Only report slots you'd actually play (24h clock, start time).
-# Courts run 07:00-21:00, so this default reports everything.
+# Only report slots starting in this window (24h clock).
 EARLIEST_HOUR = 7
 LATEST_HOUR = 21
 
@@ -57,104 +58,103 @@ SEND_WHEN_EMPTY = False
 PAGE_TIMEOUT_MS = 45_000
 SETTLE_MS = 6_000
 RETRIES = 2
-
 TELEGRAM_LIMIT = 4096
 
 # --------------------------------------------------------------------------
 # PARSING
+#
+# The booking page lists one row per time slot, and the rendered text of a row
+# looks like:
+#
+#     07:00 - 08:00
+#     60min
+#     Tennis-60min
+#     Multiple                 <- or "Padel Court 1"
+#     4 spaces available       <- or "Fully booked"
+#     Book
+#
+# So we anchor on the time range, then read the status from inside that row
+# only. Searching the whole page for the word "available" does NOT work: the
+# page has an "Available only" filter chip that matches on every single page.
 # --------------------------------------------------------------------------
 
-TIME_RE = re.compile(r"\b([01]?\d|2[0-3]):([0-5]\d)\b")
-RANGE_RE = re.compile(r"\b[01]?\d:[0-5]\d\s*[-\u2013]\s*[01]?\d:[0-5]\d\b")
+# "07:00 - 08:00". Deliberately strict: won't match "06:00am - 10:00pm"
+# (the day summary header) or the "06.00 / 22.00" slider labels.
+ROW_RE = re.compile(r"^([01]?\d|2[0-3]):([0-5]\d)\s*[-\u2013]\s*([01]?\d|2[0-3]):([0-5]\d)$")
 
-# Phrases that mean "yes, bookable".
-POSITIVE = ("available", "book now", "spaces")
+SPACES_RE = re.compile(r"(\d+)\s+spaces?\s+available", re.I)
+COURT_RE = re.compile(r"\b(?:padel\s+)?(?:court|pitch|rink)\s*\d+\b", re.I)
 
-# Checked FIRST. Anything matching here is not a free slot, even though some
-# of these contain the word "available".
-NEGATIVE = (
+# A row is bookable if its status line says one of these.
+FREE_EXACT = ("available", "book now")
+
+# ...and definitely not if it says one of these.
+TAKEN = (
+    "fully booked",
     "not available",
     "no availability",
     "unavailable",
-    "fully booked",
-    "fully",
     "sold out",
-    "member",
-    "log in",
-    "login",
-    "sign in",
-    "cookie",
+    "members only",
+    "closed",
 )
 
-# Court / resource label, e.g. "Court 3", "Padel 1".
-COURT_RE = re.compile(r"\b(?:court|padel|pitch|rink)\s*\d+\b", re.I)
-PRICE_RE = re.compile(r"£\s*\d+(?:\.\d{2})?")
-
-# How far back to look for the time a slot line belongs to.
-LOOKBACK = 8
+# How many lines after the time range still count as part of the row.
+ROW_WINDOW = 10
 
 
-def is_slot_line(line: str) -> bool:
-    low = line.lower()
-    if any(neg in low for neg in NEGATIVE):
-        return False
-    return any(pos in low for pos in POSITIVE)
-
-
-def slot_hour(time_str: str) -> int | None:
-    m = TIME_RE.search(time_str)
-    return int(m.group(1)) if m else None
-
-
-def parse_slots(page_text: str) -> list[str]:
-    """Pull free slots out of the rendered page text.
-
-    The Flow page lists a time, then the courts under it, so a slot line's
-    time sits on a nearby preceding line. Track the most recent time seen and
-    only pair it if it's within LOOKBACK lines.
-    """
+def parse_slots(page_text: str) -> list[dict]:
+    """Return [{'time': '07:00 - 08:00', 'spaces': 4, 'court': 'Court 1'}, ...]"""
     lines = [l.strip() for l in page_text.split("\n") if l.strip()]
-    slots: list[str] = []
-    last_time: str | None = None
-    last_time_idx = -999
-    last_court: str | None = None
-    last_court_idx = -999
 
-    for i, line in enumerate(lines):
-        tm = RANGE_RE.search(line) or TIME_RE.search(line)
-        if tm and not any(neg in line.lower() for neg in NEGATIVE):
-            last_time, last_time_idx = tm.group(0), i
+    # Index every line that starts a slot row.
+    starts = [i for i, l in enumerate(lines) if ROW_RE.match(l)]
+    slots: list[dict] = []
 
-        cm = COURT_RE.search(line)
-        if cm:
-            last_court, last_court_idx = cm.group(0), i
+    for n, start in enumerate(starts):
+        end = starts[n + 1] if n + 1 < len(starts) else len(lines)
+        end = min(end, start + ROW_WINDOW)
+        row = lines[start:end]
 
-        if not is_slot_line(line):
+        time_str = lines[start]
+        hour = int(ROW_RE.match(time_str).group(1))
+        if not (EARLIEST_HOUR <= hour <= LATEST_HOUR):
             continue
 
-        time_str = last_time if (i - last_time_idx) <= LOOKBACK else None
-        if time_str:
-            hour = slot_hour(time_str)
-            if hour is not None and not (EARLIEST_HOUR <= hour <= LATEST_HOUR):
-                continue
-
-        court = last_court if (i - last_court_idx) <= 3 else None
-
-        # Price usually renders just after the availability label.
-        price = None
-        for nxt in lines[i + 1 : i + 4]:
-            pm = PRICE_RE.search(nxt)
-            if pm:
-                price = pm.group(0).replace(" ", "")
+        spaces = None
+        free = False
+        for line in row[1:]:
+            low = line.lower()
+            if any(t in low for t in TAKEN):
+                free = False
+                break
+            m = SPACES_RE.search(line)
+            if m:
+                spaces = int(m.group(1))
+                free = spaces > 0
+                break
+            if low in FREE_EXACT:
+                free = True
                 break
 
-        parts = [p for p in (time_str, court, price) if p]
-        entry = "  ".join(parts) if parts else line
+        if not free:
+            continue
 
-        if entry not in slots:
-            slots.append(entry)
+        court = None
+        for line in row[1:]:
+            m = COURT_RE.search(line)
+            if m:
+                court = m.group(0)
+                break
 
-    return slots
+        slots.append({"time": time_str, "spaces": spaces, "court": court})
+
+    # Same time can appear twice (two padel courts); keep the richest entry.
+    best: dict[str, dict] = {}
+    for s in slots:
+        key = f"{s['time']}|{s['court'] or ''}"
+        best.setdefault(key, s)
+    return sorted(best.values(), key=lambda s: s["time"])
 
 
 # --------------------------------------------------------------------------
@@ -172,7 +172,7 @@ def target_dates() -> list[str]:
     return out
 
 
-async def check_url(page, url: str, debug: bool) -> list[str]:
+async def check_url(page, url: str, debug: bool) -> list[dict]:
     for attempt in range(1, RETRIES + 1):
         try:
             await page.goto(url, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT_MS)
@@ -193,7 +193,8 @@ async def check_url(page, url: str, debug: bool) -> list[str]:
                 raise RuntimeError("page looks empty (still loading?)")
 
             slots = parse_slots(text)
-            print(f"    {len(text.splitlines())} lines, {len(slots)} slot(s)")
+            rows = sum(1 for l in text.split("\n") if ROW_RE.match(l.strip()))
+            print(f"    {rows} time rows, {len(slots)} free")
             return slots
 
         except Exception as e:
@@ -204,14 +205,15 @@ async def check_url(page, url: str, debug: bool) -> list[str]:
     return []
 
 
-async def collect(debug: bool) -> list[str]:
+async def collect(debug: bool) -> dict:
+    """-> {activity: {venue: {date: [slots]}}}"""
     dates = target_dates()
     if not dates:
         print("No target dates inside the booking window.")
-        return []
+        return {}
 
     print(f"Checking dates: {', '.join(dates)}")
-    blocks: list[str] = []
+    found: dict = {}
 
     async with async_playwright() as p:
         browser = await p.chromium.launch()
@@ -222,34 +224,78 @@ async def collect(debug: bool) -> list[str]:
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
             ),
         )
-        for date_str in dates:
-            for loc_name, loc_slug in LOCATIONS.items():
-                for activity in ACTIVITIES:
+        for activity in ACTIVITIES:
+            for venue, slug in LOCATIONS.items():
+                for date_str in dates:
                     url = BASE_URL.format(
-                        location=loc_slug, activity=activity, date=date_str
+                        location=slug, activity=activity, date=date_str
                     )
-                    print(f"  {loc_name} / {activity} / {date_str}")
+                    print(f"  {activity} / {venue} / {date_str}")
                     slots = await check_url(page, url, debug)
                     if slots:
-                        day = datetime.strptime(date_str, "%Y-%m-%d").strftime(
-                            "%A %d %b"
-                        )
-                        body = "\n".join(slots)
-                        blocks.append(
-                            f"{loc_name} | {activity.upper()} | {day}\n{body}\n{url}"
-                        )
+                        found.setdefault(activity, {}).setdefault(venue, {})[
+                            date_str
+                        ] = {"slots": slots, "url": url}
         await browser.close()
 
-    return blocks
+    return found
 
 
 # --------------------------------------------------------------------------
-# TELEGRAM
+# MESSAGE
 # --------------------------------------------------------------------------
+
+
+def esc(s: str) -> str:
+    return html.escape(s, quote=False)
+
+
+def format_message(found: dict) -> str:
+    """Grouped by sport, then venue, then date. The date is a clickable link
+    so the message stays short instead of carrying raw URLs."""
+    out: list[str] = []
+
+    for activity in ACTIVITIES:
+        by_venue = found.get(activity)
+        if not by_venue:
+            continue
+
+        total = sum(
+            len(d["slots"]) for venue in by_venue.values() for d in venue.values()
+        )
+        label = ACTIVITY_LABELS.get(activity, activity.upper())
+        out.append(f"<b>{label}</b>  ({total} free)")
+
+        for venue in LOCATIONS:
+            by_date = by_venue.get(venue)
+            if not by_date:
+                continue
+            out.append(f"\n<b>{esc(venue)}</b>")
+
+            for date_str in sorted(by_date):
+                entry = by_date[date_str]
+                day = datetime.strptime(date_str, "%Y-%m-%d").strftime("%a %d %b")
+                bits = []
+                for s in entry["slots"]:
+                    start = s["time"].split("-")[0].strip()
+                    extra = []
+                    if s["court"]:
+                        extra.append(s["court"])
+                    if s["spaces"]:
+                        extra.append(f"{s['spaces']} left")
+                    bits.append(
+                        f"{start} ({', '.join(extra)})" if extra else start
+                    )
+                times = ", ".join(bits)
+                link = entry["url"]
+                out.append(f'<a href="{link}">{day}</a>  {esc(times)}')
+
+        out.append("")  # blank line between sports
+
+    return "\n".join(out).strip()
 
 
 def chunk(text: str, limit: int = TELEGRAM_LIMIT) -> list[str]:
-    """Split on blank lines so a slot block is never cut in half."""
     if len(text) <= limit:
         return [text]
     parts: list[str] = []
@@ -282,6 +328,7 @@ def send(text: str) -> None:
             json={
                 "chat_id": chat_id,
                 "text": part,
+                "parse_mode": "HTML",
                 "disable_web_page_preview": True,
             },
             timeout=30,
@@ -296,19 +343,15 @@ def send(text: str) -> None:
 
 
 async def run(args) -> None:
-    blocks = await collect(args.debug)
+    found = await collect(args.debug)
+    msg = format_message(found) if found else "No courts free in the booking window."
 
-    if blocks:
-        msg = "Courts available\n\n" + "\n\n".join(blocks)
-    else:
-        msg = "No courts available in the booking window."
-
-    print("\n" + "-" * 50 + f"\n{msg}\n" + "-" * 50)
+    print("\n" + "-" * 55 + f"\n{msg}\n" + "-" * 55)
 
     if args.dry_run:
         return
-    if not blocks and not SEND_WHEN_EMPTY:
-        print("Nothing found; staying quiet.")
+    if not found and not SEND_WHEN_EMPTY:
+        print("Nothing free; staying quiet.")
         return
     send(msg)
 
