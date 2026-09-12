@@ -2,17 +2,21 @@ name: Court watcher
 
 on:
   schedule:
-    # GitHub cron is UTC and does NOT follow British Summer Time.
-    # These are 07:10 and 18:10 London during BST (Mar-Oct).
-    # In winter they become 06:10 and 17:10 - bump both hours by 1 if you care.
-    - cron: "10 6 * * *"
-    - cron: "10 17 * * *"
-  workflow_dispatch:        # lets you run it by hand from the Actions tab
+    # Every 30 minutes, 06:00-22:30 London during BST (UTC+1).
+    # After the clocks change on 25 Oct, shift to "*/30 6-22 * * *".
+    # Overnight runs are skipped: nobody cancels a court at 04:00.
+    - cron: "*/30 5-21 * * *"
+  workflow_dispatch:
+
+# If a run overruns, don't let the next one start on top of it.
+concurrency:
+  group: court-watcher
+  cancel-in-progress: false
 
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@v4
@@ -20,6 +24,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      # Remembers which slots have already been reported. The runner is wiped
+      # after every run, so without this the bot has no memory and would
+      # re-send the same list every 30 minutes.
+      # The key is unique per run so it always writes a fresh cache; the
+      # restore-key prefix pulls in the most recent one from the last run.
+      - name: Restore seen-slots memory
+        uses: actions/cache@v4
+        with:
+          path: state
+          key: courts-state-${{ github.run_id }}
+          restore-keys: |
+            courts-state-
 
       - name: Install dependencies
         run: |
@@ -32,8 +49,6 @@ jobs:
           CHAT_ID: ${{ secrets.CHAT_ID }}
         run: python courts.py
 
-      # Only useful when something breaks - lets you read the rendered page
-      # text from the Actions run instead of guessing.
       - name: Upload debug output
         if: failure()
         uses: actions/upload-artifact@v4
